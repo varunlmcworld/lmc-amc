@@ -332,7 +332,7 @@ def document(content: str, title: str, session: dict | None = None, active: str 
     elif guest:
         nav = ''
     brand_target = '/'
-    footer = 'LMC World · End User coverage check' if guest else 'LMC World · Internal service coverage register · Manufacturer warranty is not verified by this system'
+    footer = '&copy; 2026 LMC World. All Rights Reserved.'
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{h(title)} · LMC World</title><style>{CSS}</style></head><body><header class="top"><nav class="nav"><a class="brand" href="{brand_target}">LMC WORLD</a>{nav}</nav></header><main class="container">{content}<footer class="footer">{footer}</footer></main></body></html>'''
 
 
@@ -457,7 +457,7 @@ def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "",
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LMCAMC/1.8.5"
+    server_version = "LMCAMC/1.8.6"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
