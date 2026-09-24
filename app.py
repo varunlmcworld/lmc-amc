@@ -7,6 +7,7 @@ import datetime as dt
 import hashlib
 import hmac
 import html
+import ipaddress
 import io
 import json
 import os
@@ -34,9 +35,9 @@ MAX_UPLOAD = 2 * 1024 * 1024
 SESSIONS: dict[str, dict] = {}
 GUEST_SESSIONS: dict[str, dict] = {}
 LOGIN_FAILURES: dict[str, list[float]] = {}
-GUEST_LOOKUPS: dict[str, list[float]] = {}
 LOCK = threading.RLock()
 TYPES = {"AMC", "LMC Warranty", "No Coverage"}
+RATE_WINDOW_SECONDS = 15 * 60
 
 
 def h(value) -> str:
@@ -143,7 +144,55 @@ def init_db() -> None:
             detail TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        -- Counters survive Render redeploys on the existing persistent disk.
+        -- Hashed identifiers; no raw visitor IP or serial numbers are stored.
+        CREATE TABLE IF NOT EXISTS request_limits (
+            bucket TEXT PRIMARY KEY,
+            window_start INTEGER NOT NULL,
+            count INTEGER NOT NULL
+        );
         """)
+
+
+def consume_lookup_allowance(session_token: str, client_ip: str, now: float | None = None) -> bool:
+    """Atomically allow a lookup within session, IP and site-wide budgets.
+
+    Using the existing SQLite disk ensures new sessions or a service restart
+    cannot evade the shared budgets. A 15-minute fixed window is intentionally
+    simple; it is a basic abuse limit, not a full bot/WAF solution.
+    """
+    timestamp = int(time.time() if now is None else now)
+    window = (timestamp // RATE_WINDOW_SECONDS) * RATE_WINDOW_SECONDS
+    with db_connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute("SELECT value FROM settings WHERE key='rate_limit_salt'").fetchone()
+        if row is None:
+            salt = secrets.token_hex(32)
+            db.execute("INSERT INTO settings(key,value) VALUES('rate_limit_salt',?)", (salt,))
+        else:
+            salt = row['value']
+
+        def bucket(kind: str, identifier: str) -> str:
+            fingerprint = hmac.new(bytes.fromhex(salt), f'{kind}:{identifier}'.encode(), hashlib.sha256).hexdigest()
+            return f'{kind}:{fingerprint}'
+
+        limits = ((bucket('session', session_token), 15),
+                  (bucket('ip', client_ip), 45),
+                  ('global', 600))
+        for key, limit in limits:
+            old = db.execute('SELECT count, window_start FROM request_limits WHERE bucket=?', (key,)).fetchone()
+            if old is not None and old['window_start'] == window and old['count'] >= limit:
+                return False
+        for key, _ in limits:
+            db.execute('''INSERT INTO request_limits(bucket, window_start, count)
+                          VALUES (?, ?, 1)
+                          ON CONFLICT(bucket) DO UPDATE SET
+                          count=CASE WHEN window_start=excluded.window_start THEN count+1 ELSE 1 END,
+                          window_start=excluded.window_start''', (key, window))
+        # Periodic pruning keeps the table small even with many abandoned sessions.
+        if db.execute("SELECT count FROM request_limits WHERE bucket='global'").fetchone()['count'] % 64 == 0:
+            db.execute('DELETE FROM request_limits WHERE window_start < ?', (window,))
+    return True
 
 
 def bootstrap_cloud_admin() -> None:
@@ -269,7 +318,7 @@ strong{font-weight:750}.serial{font-weight:850;letter-spacing:.3px;color:#244bc0
 .footer{font-size:12px;color:#8e99aa;padding-top:20px;text-align:center}.helper{font-size:12px;color:#728097;margin:7px 0 0}.actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.empty{padding:33px 10px;text-align:center;color:#7a879a}.number{font-variant-numeric:tabular-nums}.pagination{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding-top:15px;font-size:12px}
 .login{max-width:470px;margin:52px auto}.login h1{font-size:26px}.login .panel{padding:30px}.login .field{margin-bottom:18px}
 .guest-shell{max-width:690px;margin:32px auto}.guest-shell .panel{padding:30px}
-.guest-result{margin-top:20px}.guest-result .details{margin-top:21px}
+.guest-result{margin-top:14px}.guest-result .details{margin-top:21px}
 @media(max-width:760px){.container{padding:24px 15px 55px}.nav{padding:12px 15px}.links{margin-left:0;width:100%;gap:14px}.cards{grid-template-columns:repeat(2,1fr)}.panel{padding:17px}.formgrid,.details{grid-template-columns:1fr}.search{flex-direction:column}.hero h1{font-size:27px}.card{padding:15px}.card .value{font-size:26px}}
 """
 
@@ -394,13 +443,19 @@ def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "",
                   ('Coverage starts', human_date(asset['coverage_start'])),
                   ('Coverage ends (inclusive)', human_date(asset['coverage_end']))]
         details = ''.join(f'<div class="detail"><div class="name">{h(label)}</div><div class="answer">{h(value)}</div></div>' for label, value in fields)
-        result = f'''<section class="panel guest-result"><div class="eyebrow">SERIAL NUMBER RESULT</div><h2 style="margin-top:8px">{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div><div class="muted">LMC-provided coverage status</div></div><div class="details">{details}</div><p class="helper" style="margin-top:19px">Coverage is subject to the agreed LMC AMC terms. Manufacturer warranty is not verified here. For service, contact LMC World.</p></section>'''
-    content = f'''<div class="guest-shell"><div class="eyebrow">LMC WORLD · GUEST ACCESS</div><h1>Check your laptop coverage</h1><p class="subtitle muted">Enter the <strong>complete serial number or service tag</strong>. You do not need to select a client or know an account name.</p><section class="panel"><h2>Serial number lookup</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Laptop serial number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required autofocus autocomplete="off"></div><button class="btn" style="margin-top:18px" type="submit">Check coverage →</button></form><p class="helper" style="margin-top:13px">Only an exact serial-number match returns a result. Guest access is view-only.</p></section>{result}</div>'''
+        result = f'''<section class="panel guest-result"><div class="eyebrow">SERIAL NUMBER RESULT</div><h2 style="margin-top:8px">{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div></div><div class="details">{details}</div><p class="helper" style="margin-top:19px">Coverage is subject to the agreed LMC AMC terms. Manufacturer warranty is not verified here. For service, contact LMC World.</p></section>'''
+    # Display search results above the form. After a result, autofocus would
+    # scroll the browser down to the field, so keep focus only on first visit.
+    intro = ('' if asset is not None else
+             '<h1>Check your laptop coverage</h1><p class="subtitle muted">Enter the <strong>complete serial number or service tag</strong>. You do not need to select a client or know an account name.</p>')
+    form_title = 'Check another laptop' if asset is not None else 'Serial number lookup'
+    focus = '' if asset is not None else ' autofocus'
+    content = f'''<div class="guest-shell"><div class="eyebrow">LMC WORLD · GUEST ACCESS</div>{intro}{result}<section class="panel"><h2>{form_title}</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Laptop serial number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" style="margin-top:18px" type="submit">Check coverage →</button></form><p class="helper" style="margin-top:13px">Only an exact serial-number match returns a result. Guest access is view-only.</p></section></div>'''
     return document(content, 'Guest coverage check', guest=True)
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LMCAMC/1.4"
+    server_version = "LMCAMC/1.6.1"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
@@ -479,24 +534,25 @@ class AppHandler(BaseHTTPRequestHandler):
         return self.send(guest_page(session), headers={'Set-Cookie': cookie})
 
     def guest_rate_limited(self, token: str) -> bool:
-        """Restrict casual bulk guessing, on a session and local IP basis."""
-        now = time.time()
-        # Render can put many visitors behind one proxy IP. The second bucket is
-        # an overall ceiling, not reliable per-visitor enforcement.
-        keys = ((f'session:{token}', 15), (f'origin:{self.client_address[0]}', 900 if CLOUD else 90))
-        with LOCK:
-            for key, _ in keys:
-                GUEST_LOOKUPS[key] = [t for t in GUEST_LOOKUPS.get(key, []) if now - t < 900]
-            if any(len(GUEST_LOOKUPS[key]) >= limit for key, limit in keys):
-                return True
-            for key, _ in keys:
-                GUEST_LOOKUPS[key].append(now)
-            # Expired buckets needn't remain in memory forever.
-            if len(GUEST_LOOKUPS) > 5000:
-                for key, timestamps in list(GUEST_LOOKUPS.items()):
-                    if not timestamps or now - timestamps[-1] >= 900:
-                        GUEST_LOOKUPS.pop(key, None)
-        return False
+        return not consume_lookup_allowance(token, self.visitor_ip())
+
+    def visitor_ip(self) -> str:
+        """On Render use the forwarded client IP; locally ignore spoofed headers.
+
+        Prefer the last address instead of the leftmost user-supplied XFF item:
+        a caller cannot change an existing trusted proxy-appended address by
+        prepending a fake value. If the header is absent or invalid, fall back
+        to the socket IP; a site-wide ceiling still applies either way.
+        """
+        if CLOUD:
+            forwarded = self.headers.get('X-Forwarded-For', '')
+            if forwarded:
+                candidate = forwarded.split(',')[-1].strip()
+                try:
+                    return str(ipaddress.ip_address(candidate))
+                except ValueError:
+                    pass
+        return self.client_address[0]
 
     def form(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -636,7 +692,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 db.execute("INSERT INTO settings(key,value) VALUES('admin_password',?)",(password_hash(pw),))
             return self.redirect('/login')
         if path=='/login':
-            ip=self.client_address[0]
+            ip=self.visitor_ip()
             now=time.time()
             with LOCK:
                 failures=[t for t in LOGIN_FAILURES.get(ip,[]) if now-t<900]
@@ -661,7 +717,8 @@ class AppHandler(BaseHTTPRequestHandler):
             if not hmac.compare_digest(str(form.get('csrf', '')), guest['csrf']):
                 return self.fail(403, 'Guest session verification failed. Reload Guest Check and try again.')
             if self.guest_rate_limited(guest['token']):
-                return self.send(guest_page(guest, error='Too many searches. Please try again in 15 minutes.'), 429)
+                return self.send(guest_page(guest, error='Too many searches. Please try again in 15 minutes.'),
+                                 429, headers={'Retry-After': str(RATE_WINDOW_SECONDS)})
             serial = str(form.get('serial_number', ''))
             key = normalize_serial(serial)
             if len(serial) > 100 or len(key) < 3 or len(key) > 100:
