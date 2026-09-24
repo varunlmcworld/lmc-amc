@@ -333,7 +333,7 @@ def document(content: str, title: str, session: dict | None = None, active: str 
         nav = ''
     brand_target = '/'
     footer = 'LMC World · End User coverage check' if guest else 'LMC World · Internal service coverage register · Manufacturer warranty is not verified by this system'
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{h(title)} · LMC World</title><style>{CSS}</style></head><body><header class="top"><nav class="nav"><a class="brand" href="{brand_target}">LMC WORLD<small>AMC MANAGER</small></a>{nav}</nav></header><main class="container">{content}<footer class="footer">{footer}</footer></main></body></html>'''
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{h(title)} · LMC World</title><style>{CSS}</style></head><body><header class="top"><nav class="nav"><a class="brand" href="{brand_target}">LMC WORLD</a>{nav}</nav></header><main class="container">{content}<footer class="footer">{footer}</footer></main></body></html>'''
 
 
 def csrf_field(session: dict) -> str:
@@ -452,12 +452,12 @@ def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "",
     # Always render a single public landing. Results precede both forms.
     # Avoid autofocus after a result so the browser doesn't scroll away from it.
     focus = '' if asset is not None or login_error else ' autofocus'
-    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>View Device Coverage</h1></div>{result}<div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup"><h2>Client Login</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" type="submit">Submit</button></form></section><section class="panel" id="admin"><h2>Admin Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Enter password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn" type="submit">Log In</button></form></section></div></div>'''
-    return document(content, 'View Device Coverage', guest=True)
+    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>AMC Portal</h1></div>{result}<div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup"><h2>Check Coverage</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" type="submit">Submit</button></form></section><section class="panel" id="admin"><h2>Admin Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Enter password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn" type="submit">Log In</button></form></section></div></div>'''
+    return document(content, 'AMC Portal', guest=True)
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LMCAMC/1.8.4"
+    server_version = "LMCAMC/1.8.5"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
