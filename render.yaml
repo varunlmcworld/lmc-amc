@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: lmc-amc
+    runtime: python
+    plan: 0.5c-512mb
+    buildCommand: python3 -m compileall -q app.py
+    startCommand: python3 -u app.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: AMC_CLOUD
+        value: '1'
+      - key: AMC_HOST
+        value: 0.0.0.0
+      - key: AMC_HTTPS
+        value: '1'
+      - key: AMC_DB_PATH
+        value: /var/data/amc.db
+      - key: AMC_BOOTSTRAP_PASSWORD
+        sync: false
+    disk:
+      name: lmc-amc-data
+      mountPath: /var/data
+      sizeGB: 1
