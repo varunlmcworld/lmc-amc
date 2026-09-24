@@ -436,10 +436,12 @@ def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "",
     result = ''
     if asset is not None:
         status, days, color = coverage_status(asset)
-        # Explicit allowlist: no client name, purchase date, invoice, notes,
-        # asset ID or history is disclosed to visitors with a serial number.
-        fields = [('Manufacturer', asset['manufacturer']), ('Model', asset['model']),
-                  ('Serial number', asset['serial_number']), ('LMC plan', asset['coverage_type']),
+        # Owner / B2B client is intentionally public for exact-serial lookups.
+        # Never include purchase dates, invoice references, internal notes,
+        # asset IDs or history in the guest response.
+        fields = [('Owner / B2B client', asset['client_name']),
+                  ('Manufacturer', asset['manufacturer']), ('Model', asset['model']),
+                  ('Serial number', asset['serial_number']),
                   ('Coverage starts', human_date(asset['coverage_start'])),
                   ('Coverage ends (inclusive)', human_date(asset['coverage_end']))]
         details = ''.join(f'<div class="detail"><div class="name">{h(label)}</div><div class="answer">{h(value)}</div></div>' for label, value in fields)
@@ -724,8 +726,8 @@ class AppHandler(BaseHTTPRequestHandler):
             if len(serial) > 100 or len(key) < 3 or len(key) > 100:
                 return self.send(guest_page(guest, error='Enter the complete serial number (3–100 characters).'), 400)
             with db_connect() as db:
-                # Exact match only, and retrieve only columns approved for guest view.
-                asset = db.execute('SELECT manufacturer, model, serial_number, coverage_type, coverage_start, coverage_end FROM assets WHERE serial_key=?', (key,)).fetchone()
+                # Exact match only. Public fields are explicitly allowlisted.
+                asset = db.execute('SELECT client_name, manufacturer, model, serial_number, coverage_type, coverage_start, coverage_end FROM assets WHERE serial_key=?', (key,)).fetchone()
             if asset is None:
                 return self.send(guest_page(guest, error='No matching coverage record found. Check the full serial number or contact LMC World.'), 200)
             return self.send(guest_page(guest, asset=asset))
