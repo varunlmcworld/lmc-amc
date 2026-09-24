@@ -317,7 +317,7 @@ strong{font-weight:750}.serial{font-weight:850;letter-spacing:.3px;color:#244bc0
 .notice{padding:12px 15px;border:1px solid #d9e5f9;background:#edf4ff;color:#254778;border-radius:10px;font-size:13px;margin-bottom:18px}.notice.error{background:#fff1f1;color:#9b2034;border-color:#ffd7dc}
 .footer{font-size:12px;color:#8e99aa;padding-top:20px;text-align:center}.helper{font-size:12px;color:#728097;margin:7px 0 0}.actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.empty{padding:33px 10px;text-align:center;color:#7a879a}.number{font-variant-numeric:tabular-nums}.pagination{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding-top:15px;font-size:12px}
 .login{max-width:470px;margin:52px auto}.login h1{font-size:26px}.login .panel{padding:30px}.login .field{margin-bottom:18px}
-.guest-result{margin-top:14px}.guest-result .details{margin-top:21px}
+.guest-result{margin-top:14px}.guest-result .details{margin-top:21px}.guest-result .guest-back{margin-top:25px}.guest-result .guest-back .btn{width:100%}
 .landing-shell{max-width:1060px;margin:28px auto}.landing-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:19px;align-items:stretch}
 .landing-grid .panel{padding:27px;min-height:260px;display:flex;flex-direction:column}.landing-grid form{flex:1;display:flex;flex-direction:column}.landing-grid .field label{display:block;font-size:12px;color:#596981;font-weight:750;margin-bottom:9px}.landing-grid form .btn{align-self:stretch;width:100%;margin-top:auto!important}.landing-shell .guest-result{padding:30px}.landing-intro{margin-bottom:19px}
 @media(max-width:760px){.landing-grid{grid-template-columns:1fr}.landing-grid .panel{padding:20px}.landing-shell .guest-result{padding:20px}}
@@ -433,7 +433,7 @@ def import_page(session: dict, message: str = "", error: bool = False) -> str:
 
 
 def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "", serial: str = "", login_error: str = "") -> str:
-    # Unified public landing: read-only exact-serial lookup and separate admin authentication.
+    # Public landing offers lookup and admin authentication. Successful lookup gets its own result screen.
     notice = f'<div class="notice error" role="alert">{h(error)}</div>' if error else ''
     login_notice = f'<div class="notice error" role="alert">{h(login_error)}</div>' if login_error else ''
     result = ''
@@ -448,16 +448,17 @@ def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "",
                   ('Coverage starts', human_date(asset['coverage_start'])),
                   ('Coverage ends (inclusive)', human_date(asset['coverage_end']))]
         details = ''.join(f'<div class="detail"><div class="name">{h(label)}</div><div class="answer">{h(value)}</div></div>' for label, value in fields)
-        result = f'''<section class="panel guest-result" aria-label="Coverage result"><h2 style="margin-top:0">{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div></div><div class="details">{details}</div></section>'''
-    # Always render a single public landing. Results precede both forms.
-    # Avoid autofocus after a result so the browser doesn't scroll away from it.
-    focus = '' if asset is not None or login_error else ' autofocus'
-    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>AMC Portal</h1></div>{result}<div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup"><h2>Check Coverage</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" type="submit">Submit</button></form></section><section class="panel" id="admin"><h2>Admin Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Enter password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn" type="submit">Log In</button></form></section></div></div>'''
+        result = f'''<section class="panel guest-result" aria-label="Coverage result"><h2 style="margin-top:0">{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div></div><div class="details">{details}</div><div class="guest-back"><a class="btn" href="/guest">← Back</a></div></section>'''
+        # No login or lookup form on a successful result. Back returns to a fresh public landing.
+        return document(f'''<div class="landing-shell"><div class="landing-intro"><h1>AMC Portal</h1></div>{result}</div>''', 'AMC Portal', guest=True)
+    # Missing/invalid serials and admin-login errors retain the two usable landing forms.
+    focus = '' if login_error else ' autofocus'
+    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>AMC Portal</h1></div><div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup"><h2>Check Coverage</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" type="submit">Submit</button></form></section><section class="panel" id="admin"><h2>Admin Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Enter password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn" type="submit">Log In</button></form></section></div></div>'''
     return document(content, 'AMC Portal', guest=True)
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LMCAMC/1.8.6"
+    server_version = "LMCAMC/1.8.7"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
