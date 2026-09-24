@@ -317,8 +317,10 @@ strong{font-weight:750}.serial{font-weight:850;letter-spacing:.3px;color:#244bc0
 .notice{padding:12px 15px;border:1px solid #d9e5f9;background:#edf4ff;color:#254778;border-radius:10px;font-size:13px;margin-bottom:18px}.notice.error{background:#fff1f1;color:#9b2034;border-color:#ffd7dc}
 .footer{font-size:12px;color:#8e99aa;padding-top:20px;text-align:center}.helper{font-size:12px;color:#728097;margin:7px 0 0}.actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.empty{padding:33px 10px;text-align:center;color:#7a879a}.number{font-variant-numeric:tabular-nums}.pagination{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding-top:15px;font-size:12px}
 .login{max-width:470px;margin:52px auto}.login h1{font-size:26px}.login .panel{padding:30px}.login .field{margin-bottom:18px}
-.guest-shell{max-width:690px;margin:32px auto}.guest-shell .panel{padding:30px}
 .guest-result{margin-top:14px}.guest-result .details{margin-top:21px}
+.landing-shell{max-width:1060px;margin:28px auto}.landing-grid{display:grid;grid-template-columns:minmax(0,1.18fr) minmax(0,1fr);gap:19px;align-items:start}
+.landing-grid .panel{padding:27px}.landing-shell .guest-result{padding:30px}.landing-intro{margin-bottom:19px}
+@media(max-width:760px){.landing-grid{grid-template-columns:1fr}.landing-grid .panel{padding:20px}.landing-shell .guest-result{padding:20px}}
 @media(max-width:760px){.container{padding:24px 15px 55px}.nav{padding:12px 15px}.links{margin-left:0;width:100%;gap:14px}.cards{grid-template-columns:repeat(2,1fr)}.panel{padding:17px}.formgrid,.details{grid-template-columns:1fr}.search{flex-direction:column}.hero h1{font-size:27px}.card{padding:15px}.card .value{font-size:26px}}
 """
 
@@ -326,11 +328,11 @@ strong{font-weight:750}.serial{font-weight:850;letter-spacing:.3px;color:#244bc0
 def document(content: str, title: str, session: dict | None = None, active: str = "", guest: bool = False) -> str:
     nav = ""
     if session:
-        nav = f'''<div class="links"><a class="{'current' if active == 'dashboard' else ''}" href="/">Dashboard</a><a href="/guest">Guest view</a><a class="{'current' if active == 'import' else ''}" href="/import">Import</a><a href="/export.csv">Export CSV</a><a href="/backup.db">DB Backup</a><form action="/logout" method="post" style="margin:0">{csrf_field(session)}<button class="nav-logout">Log out</button></form></div>'''
+        nav = f'''<div class="links"><a class="{'current' if active == 'dashboard' else ''}" href="/">Dashboard</a><a href="/guest">Coverage lookup</a><a class="{'current' if active == 'import' else ''}" href="/import">Import</a><a href="/export.csv">Export CSV</a><a href="/backup.db">DB Backup</a><form action="/logout" method="post" style="margin:0">{csrf_field(session)}<button class="nav-logout">Log out</button></form></div>'''
     elif guest:
-        nav = '<div class="links"><a href="/login">Administrator sign in →</a></div>'
-    brand_target = '/guest' if guest else '/'
-    footer = 'LMC World · Guest service coverage check · Manufacturer warranty is not verified here' if guest else 'LMC World · Internal service coverage register · Manufacturer warranty is not verified by this system'
+        nav = ''
+    brand_target = '/'
+    footer = 'LMC World · End User coverage check' if guest else 'LMC World · Internal service coverage register · Manufacturer warranty is not verified by this system'
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{h(title)} · LMC World</title><style>{CSS}</style></head><body><header class="top"><nav class="nav"><a class="brand" href="{brand_target}">LMC WORLD<small>AMC MANAGER</small></a>{nav}</nav></header><main class="container">{content}<footer class="footer">{footer}</footer></main></body></html>'''
 
 
@@ -430,34 +432,33 @@ def import_page(session: dict, message: str = "", error: bool = False) -> str:
     return document(f'''<div class="hero"><div><div class="eyebrow">BULK ONBOARDING</div><h1>Import laptop records</h1><p class="subtitle muted">Move your historical invoice records into the AMC register with a CSV file.</p></div><a class="btn secondary" href="/">← Dashboard</a></div>{notice}<section class="panel"><h2>1. Prepare your CSV</h2><p class="muted">Download the template, fill one row per laptop, and save as UTF-8 CSV. Purchase and coverage dates can be YYYY-MM-DD or DD/MM/YYYY.</p><a class="btn secondary" href="/template.csv">↓ Download blank template</a><p class="helper">Required columns: client_name, model, serial_number, purchase_date, coverage_type. For AMC/LMC Warranty, coverage_start and coverage_end are also required.</p></section><section class="panel"><h2>2. Upload and import</h2><form action="/import" method="post" enctype="multipart/form-data">{csrf_field(session)}<div class="field" style="margin-bottom:19px"><label for="file">CSV file (maximum 2 MB)</label><input id="file" class="input" type="file" name="file" accept=".csv,text/csv" required></div><button class="btn" type="submit">Import laptop records</button></form><p class="helper" style="margin-top:14px">Existing serial numbers are skipped, never silently overwritten. Invalid rows are reported. Export a backup before large imports.</p></section>''','Import CSV',session,'import')
 
 
-def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "", serial: str = "") -> str:
-    """Read-only exact-serial lookup. Never interpolate a private database field here."""
-    notice = f'<div class="notice error">{h(error)}</div>' if error else ''
+def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "", serial: str = "", login_error: str = "") -> str:
+    # Unified public landing: read-only exact-serial lookup and separate admin authentication.
+    notice = f'<div class="notice error" role="alert">{h(error)}</div>' if error else ''
+    login_notice = f'<div class="notice error" role="alert">{h(login_error)}</div>' if login_error else ''
     result = ''
     if asset is not None:
         status, days, color = coverage_status(asset)
-        # Owner / B2B client is intentionally public for exact-serial lookups.
-        # Never include purchase dates, invoice references, internal notes,
-        # asset IDs or history in the guest response.
+        # The business owner is deliberately public on exact-serial matches.
+        # Never expose purchase dates, invoice references, internal notes,
+        # asset IDs or history in this response.
         fields = [('Owner / B2B client', asset['client_name']),
                   ('Manufacturer', asset['manufacturer']), ('Model', asset['model']),
                   ('Serial number', asset['serial_number']),
                   ('Coverage starts', human_date(asset['coverage_start'])),
                   ('Coverage ends (inclusive)', human_date(asset['coverage_end']))]
         details = ''.join(f'<div class="detail"><div class="name">{h(label)}</div><div class="answer">{h(value)}</div></div>' for label, value in fields)
-        result = f'''<section class="panel guest-result"><div class="eyebrow">SERIAL NUMBER RESULT</div><h2 style="margin-top:8px">{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div></div><div class="details">{details}</div><p class="helper" style="margin-top:19px">Coverage is subject to the agreed LMC AMC terms. Manufacturer warranty is not verified here. For service, contact LMC World.</p></section>'''
-    # Display search results above the form. After a result, autofocus would
-    # scroll the browser down to the field, so keep focus only on first visit.
-    intro = ('' if asset is not None else
-             '<h1>Check your laptop coverage</h1><p class="subtitle muted">Enter the <strong>complete serial number or service tag</strong>. You do not need to select a client or know an account name.</p>')
-    form_title = 'Check another laptop' if asset is not None else 'Serial number lookup'
-    focus = '' if asset is not None else ' autofocus'
-    content = f'''<div class="guest-shell"><div class="eyebrow">LMC WORLD · GUEST ACCESS</div>{intro}{result}<section class="panel"><h2>{form_title}</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Laptop serial number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" style="margin-top:18px" type="submit">Check coverage →</button></form><p class="helper" style="margin-top:13px">Only an exact serial-number match returns a result. Guest access is view-only.</p></section></div>'''
-    return document(content, 'Guest coverage check', guest=True)
+        result = f'''<section class="panel guest-result" aria-label="Coverage result"><h2 style="margin-top:0">{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div></div><div class="details">{details}</div></section>'''
+    # Always render a single public landing. Results precede both forms.
+    # Avoid autofocus after a result so the browser doesn't scroll away from it.
+    form_title = 'Check another laptop' if asset is not None else 'Check coverage'
+    focus = '' if asset is not None or login_error else ' autofocus'
+    content = f'''<div class="landing-shell"><div class="landing-intro"><div class="eyebrow">LMC WORLD · AMC MANAGER</div><h1>Laptop coverage portal</h1><p class="subtitle muted">Check your LMC coverage or sign in to manage records.</p></div>{result}<div class="landing-grid"><section class="panel" id="coverage"><h2 style="margin-top:0">{form_title}</h2><p class="subtitle muted">Enter the complete laptop serial number or service tag. No client login is required.</p>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Serial number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" style="margin-top:18px" type="submit">Check coverage →</button></form><p class="helper" style="margin-top:13px">Only an exact serial-number match returns a result. Lookup is read-only.</p></section><section class="panel" id="admin"><div class="eyebrow">INTERNAL ACCESS</div><h2 style="margin-top:8px">Admin Login</h2><p class="subtitle muted">Manage laptop records, customer details and coverage.</p>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Administrator password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn secondary" style="margin-top:18px" type="submit">Sign in →</button></form></section></div></div>'''
+    return document(content, 'Laptop coverage portal', guest=True)
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LMCAMC/1.6.1"
+    server_version = "LMCAMC/1.8.1"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
@@ -519,21 +520,25 @@ class AppHandler(BaseHTTPRequestHandler):
             session['last'] = time.time()
             return session
 
-    def guest_entry(self):
+    def ensure_guest_session(self) -> tuple[dict, str | None]:
         session = self.guest_session()
         if session is not None:
-            return self.send(guest_page(session))
+            return session, None
         token = secrets.token_urlsafe(32)
         session = {'csrf': secrets.token_urlsafe(32), 'last': time.time(), 'token': token}
         with LOCK:
-            # Avoid retaining abandoned guest sessions indefinitely.
             now = time.time()
             for key, old in list(GUEST_SESSIONS.items()):
                 if now - old['last'] > 2 * 3600:
                     GUEST_SESSIONS.pop(key, None)
             GUEST_SESSIONS[token] = session
         cookie = f'lmc_guest={token}; HttpOnly; SameSite=Strict; Path=/' + ('; Secure' if os.environ.get('AMC_HTTPS') == '1' else '')
-        return self.send(guest_page(session), headers={'Set-Cookie': cookie})
+        return session, cookie
+
+    def guest_entry(self, login_error: str = '', status: int = 200):
+        session, cookie = self.ensure_guest_session()
+        headers = {'Set-Cookie': cookie} if cookie else None
+        return self.send(guest_page(session, login_error=login_error), status, headers=headers)
 
     def guest_rate_limited(self, token: str) -> bool:
         return not consume_lookup_allowance(token, self.visitor_ip())
@@ -606,9 +611,12 @@ class AppHandler(BaseHTTPRequestHandler):
             if path != '/setup':
                 return self.redirect('/setup')
             return self.send(self.setup_page())
-        if path == '/login':
-            if self.session(): return self.redirect('/')
-            return self.send(self.login_page())
+        if path in ('/', '/login'):
+            session = self.session()
+            if session is None:
+                return self.guest_entry()
+            if path == '/login':
+                return self.redirect('/')
         if path == '/guest':
             return self.guest_entry()
         session = self.session()
@@ -663,9 +671,6 @@ class AppHandler(BaseHTTPRequestHandler):
         notice=f'<div class="notice error">{h(error)}</div>' if error else ''
         return document(f'''<div class="login"><div class="panel"><div class="eyebrow">WELCOME TO LMC WORLD</div><h1>Set up AMC Manager</h1><p class="subtitle muted">Create an administrator password. Your laptop database will be stored locally in the <strong>data</strong> folder.</p>{notice}<form action="/setup" method="post"><div class="field"><label>Choose password (minimum 10 characters)</label><input class="input" type="password" name="password" minlength="10" required autocomplete="new-password"></div><div class="field"><label>Confirm password</label><input class="input" type="password" name="confirm" minlength="10" required autocomplete="new-password"></div><button class="btn" type="submit">Create secure account</button></form><p class="helper">First-time setup is only allowed from this computer. Back up your database regularly.</p></div></div>''','Setup')
 
-    def login_page(self,error=''):
-        notice=f'<div class="notice error">{h(error)}</div>' if error else ''
-        return document(f'''<div class="login"><div class="panel"><div class="eyebrow">INTERNAL EMPLOYEE ACCESS</div><h1>Welcome back</h1><p class="subtitle muted">Sign in to verify and manage LMC World laptop coverage.</p>{notice}<form action="/login" method="post"><div class="field"><label>Administrator password</label><input class="input" type="password" name="password" required autofocus></div><button class="btn" type="submit">Sign in →</button></form><div style="margin-top:22px;padding-top:20px;border-top:1px solid #e8edf4"><strong>Just checking a laptop?</strong><p class="helper">Employees and customers can use read-only guest access without the administrator password.</p><a class="btn secondary" style="margin-top:13px" href="/guest">Continue as guest →</a></div></div></div>''','Sign in')
 
     def do_POST(self):
         try:
@@ -700,12 +705,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 failures=[t for t in LOGIN_FAILURES.get(ip,[]) if now-t<900]
                 LOGIN_FAILURES[ip]=failures
                 if len(failures)>=8:
-                    return self.send(self.login_page('Too many attempts. Try again in 15 minutes.'),429)
+                    return self.guest_entry(login_error='Too many attempts. Try again in 15 minutes.', status=429)
             with db_connect() as db:
                 stored=db.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()['value']
             if not verify_password(str(form.get('password','')),stored):
                 with LOCK: LOGIN_FAILURES.setdefault(ip,[]).append(now)
-                return self.send(self.login_page('Incorrect password.'),401)
+                return self.guest_entry(login_error='Incorrect password.', status=401)
             token=secrets.token_urlsafe(32)
             with LOCK:
                 LOGIN_FAILURES.pop(ip,None)
@@ -715,7 +720,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == '/guest/lookup':
             guest = self.guest_session()
             if guest is None:
-                return self.redirect('/guest')
+                return self.redirect('/')
             if not hmac.compare_digest(str(form.get('csrf', '')), guest['csrf']):
                 return self.fail(403, 'Guest session verification failed. Reload Guest Check and try again.')
             if self.guest_rate_limited(guest['token']):
