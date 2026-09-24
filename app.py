@@ -319,7 +319,7 @@ strong{font-weight:750}.serial{font-weight:850;letter-spacing:.3px;color:#244bc0
 .login{max-width:470px;margin:52px auto}.login h1{font-size:26px}.login .panel{padding:30px}.login .field{margin-bottom:18px}
 .guest-result{margin-top:14px}.guest-result .details{margin-top:21px}
 .landing-shell{max-width:1060px;margin:28px auto}.landing-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:19px;align-items:stretch}
-.landing-grid .panel{padding:27px;min-height:260px;display:flex;flex-direction:column}.landing-grid form{flex:1;display:flex;flex-direction:column}.landing-grid form .btn{align-self:flex-start;margin-top:auto!important}.landing-grid .helper{margin:13px 0 16px}.landing-shell .guest-result{padding:30px}.landing-intro{margin-bottom:19px}
+.landing-grid .panel{padding:27px;min-height:260px;display:flex;flex-direction:column}.landing-grid form{flex:1;display:flex;flex-direction:column}.landing-grid .field label{display:block;font-size:12px;color:#596981;font-weight:750;margin-bottom:9px}.landing-grid form .btn{align-self:stretch;width:100%;margin-top:auto!important}.landing-shell .guest-result{padding:30px}.landing-intro{margin-bottom:19px}
 @media(max-width:760px){.landing-grid{grid-template-columns:1fr}.landing-grid .panel{padding:20px}.landing-shell .guest-result{padding:20px}}
 @media(max-width:760px){.container{padding:24px 15px 55px}.nav{padding:12px 15px}.links{margin-left:0;width:100%;gap:14px}.cards{grid-template-columns:repeat(2,1fr)}.panel{padding:17px}.formgrid,.details{grid-template-columns:1fr}.search{flex-direction:column}.hero h1{font-size:27px}.card{padding:15px}.card .value{font-size:26px}}
 """
@@ -452,12 +452,12 @@ def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "",
     # Always render a single public landing. Results precede both forms.
     # Avoid autofocus after a result so the browser doesn't scroll away from it.
     focus = '' if asset is not None or login_error else ' autofocus'
-    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>View Device Coverage</h1></div>{result}<div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup">{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><p class="helper">Only an exact serial-number match returns a result. Lookup is read-only.</p><button class="btn" type="submit">Check coverage →</button></form></section><section class="panel" id="admin"><h2>Admin Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Enter password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn secondary" type="submit">Log In →</button></form></section></div></div>'''
+    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>View Device Coverage</h1></div>{result}<div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup"><h2>Client Login</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" type="submit">Submit</button></form></section><section class="panel" id="admin"><h2>Admin Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Enter password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn" type="submit">Log In</button></form></section></div></div>'''
     return document(content, 'View Device Coverage', guest=True)
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LMCAMC/1.8.3"
+    server_version = "LMCAMC/1.8.4"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
