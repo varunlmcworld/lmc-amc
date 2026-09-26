@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LMC World AMC Manager — local and Render cloud with Guest Check."""
+"""LMC World AMC Portal — public lookup with role-based Admin and B2B Client access."""
 from __future__ import annotations
 
 import csv
@@ -112,6 +112,48 @@ def db_connect():
         db.close()
 
 
+def username_key(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip()).casefold()
+
+
+def client_name_key(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def ensure_client(db: sqlite3.Connection, name: str) -> int:
+    clean = re.sub(r"\s+", " ", (name or "").strip())
+    if not clean:
+        raise ValueError("Client name is required.")
+    key = client_name_key(clean)
+    row = db.execute("SELECT id FROM clients WHERE name_key=?", (key,)).fetchone()
+    if row:
+        db.execute("UPDATE clients SET name=?, updated_at=datetime('now') WHERE id=?", (clean, row['id']))
+        return int(row['id'])
+    cur = db.execute("INSERT INTO clients(name,name_key) VALUES(?,?)", (clean, key))
+    return int(cur.lastrowid)
+
+
+def get_user_by_credentials(username: str, password: str):
+    key = username_key(username)
+    if not key or len(key) > 80:
+        return None
+    with db_connect() as db:
+        row = db.execute("""SELECT u.*, c.name AS client_name, c.active AS client_active
+                            FROM users u LEFT JOIN clients c ON c.id=u.client_id
+                            WHERE u.username_key=? LIMIT 1""", (key,)).fetchone()
+    if row is None or not row['active']:
+        return None
+    if row['role'] == 'client' and not row['client_active']:
+        return None
+    return row if verify_password(password, row['password_hash']) else None
+
+
+def session_for_user(row: sqlite3.Row) -> dict:
+    return {'csrf': secrets.token_urlsafe(32), 'last': time.time(), 'user_id': int(row['id']),
+            'username': row['username'], 'role': row['role'],
+            'client_id': row['client_id'], 'client_name': row['client_name'] if row['role']=='client' else None}
+
+
 def init_db() -> None:
     with db_connect() as db:
         db.execute("PRAGMA journal_mode=WAL")
@@ -119,6 +161,27 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            name_key TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            username_key TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin','client')),
+            client_id INTEGER REFERENCES clients(id),
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK ((role='admin' AND client_id IS NULL) OR (role='client' AND client_id IS NOT NULL))
+        );
+        CREATE INDEX IF NOT EXISTS idx_users_client ON users(client_id);
         CREATE TABLE IF NOT EXISTS assets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_name TEXT NOT NULL,
@@ -144,14 +207,26 @@ def init_db() -> None:
             detail TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
-        -- Counters survive Render redeploys on the existing persistent disk.
-        -- Hashed identifiers; no raw visitor IP or serial numbers are stored.
         CREATE TABLE IF NOT EXISTS request_limits (
             bucket TEXT PRIMARY KEY,
             window_start INTEGER NOT NULL,
             count INTEGER NOT NULL
         );
         """)
+        columns = {row['name'] for row in db.execute("PRAGMA table_info(assets)").fetchall()}
+        if 'client_id' not in columns:
+            db.execute("ALTER TABLE assets ADD COLUMN client_id INTEGER REFERENCES clients(id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_assets_client_id ON assets(client_id)")
+        names = db.execute("SELECT DISTINCT client_name FROM assets WHERE trim(client_name) != ''").fetchall()
+        for row in names:
+            cid = ensure_client(db, row['client_name'])
+            db.execute("UPDATE assets SET client_id=? WHERE client_id IS NULL AND lower(trim(client_name))=lower(trim(?))", (cid, row['client_name']))
+        # Seamless upgrade from v1.8.x. Existing password remains valid; username becomes admin.
+        admin = db.execute("SELECT id FROM users WHERE role='admin' LIMIT 1").fetchone()
+        legacy = db.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()
+        if admin is None and legacy is not None:
+            db.execute("INSERT INTO users(username,username_key,password_hash,role,client_id,active) VALUES(?,?,?,?,NULL,1)",
+                       ('admin', username_key('admin'), legacy['value'], 'admin'))
 
 
 def consume_lookup_allowance(session_token: str, client_ip: str, now: float | None = None) -> bool:
@@ -196,17 +271,27 @@ def consume_lookup_allowance(session_token: str, client_ip: str, now: float | No
 
 
 def bootstrap_cloud_admin() -> None:
-    """One-time cloud admin setup. Never publish a first-user registration form."""
+    """One-time cloud admin setup; existing v1.8.x admin password is preserved."""
     if not CLOUD:
         return
+    username = (os.environ.get("AMC_BOOTSTRAP_USERNAME") or "admin").strip()
     pw = os.environ.get("AMC_BOOTSTRAP_PASSWORD", "")
     with db_connect() as db:
-        existing = db.execute("SELECT 1 FROM settings WHERE key='admin_password'").fetchone()
+        existing = db.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1").fetchone()
         if existing:
-            return  # A redeploy must never reset the existing admin password.
-        if not 14 <= len(pw) <= 200:
-            raise RuntimeError("Set AMC_BOOTSTRAP_PASSWORD (14-200 chars) as a private Render environment variable before first deployment.")
-        db.execute("INSERT INTO settings(key,value) VALUES('admin_password',?)", (password_hash(pw),))
+            return
+        legacy = db.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()
+        if legacy is not None:
+            digest = legacy['value']
+        else:
+            if not 14 <= len(pw) <= 200:
+                raise RuntimeError("Set AMC_BOOTSTRAP_PASSWORD (14-200 chars) before first deployment.")
+            digest = password_hash(pw)
+            db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_password',?)", (digest,))
+        if not username_key(username):
+            raise RuntimeError("AMC_BOOTSTRAP_USERNAME must contain a username.")
+        db.execute("INSERT INTO users(username,username_key,password_hash,role,client_id,active) VALUES(?,?,?,?,NULL,1)",
+                   (username, username_key(username), digest, 'admin'))
 
 
 def validate_cloud_configuration() -> None:
@@ -328,9 +413,10 @@ strong{font-weight:750}.serial{font-weight:850;letter-spacing:.3px;color:#244bc0
 def document(content: str, title: str, session: dict | None = None, active: str = "", guest: bool = False) -> str:
     nav = ""
     if session:
-        nav = f'''<div class="links"><a class="{'current' if active == 'dashboard' else ''}" href="/">Dashboard</a><a href="/guest">Coverage lookup</a><a class="{'current' if active == 'import' else ''}" href="/import">Import</a><a href="/export.csv">Export CSV</a><a href="/backup.db">DB Backup</a><form action="/logout" method="post" style="margin:0">{csrf_field(session)}<button class="nav-logout">Log out</button></form></div>'''
-    elif guest:
-        nav = ''
+        if session.get('role') == 'admin':
+            nav = f'''<div class="links"><a class="{'current' if active == 'dashboard' else ''}" href="/">Dashboard</a><a class="{'current' if active == 'lookup' else ''}" href="/lookup">Check Coverage</a><a class="{'current' if active == 'clients' else ''}" href="/clients">Clients</a><a class="{'current' if active == 'import' else ''}" href="/import">Import</a><a href="/export.csv">Export CSV</a><a href="/backup.db">DB Backup</a><form action="/logout" method="post" style="margin:0">{csrf_field(session)}<button class="nav-logout">Log out</button></form></div>'''
+        else:
+            nav = f'''<div class="links"><a class="{'current' if active == 'dashboard' else ''}" href="/">My Devices</a><a class="{'current' if active == 'lookup' else ''}" href="/lookup">Check Coverage</a><form action="/logout" method="post" style="margin:0">{csrf_field(session)}<button class="nav-logout">Log out</button></form></div>'''
     brand_target = '/'
     footer = '&copy; 2026 LMC World. All Rights Reserved.'
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>{h(title)} · LMC World</title><style>{CSS}</style></head><body><header class="top"><nav class="nav"><a class="brand" href="{brand_target}">LMC WORLD</a>{nav}</nav></header><main class="container">{content}<footer class="footer">{footer}</footer></main></body></html>'''
@@ -432,16 +518,110 @@ def import_page(session: dict, message: str = "", error: bool = False) -> str:
     return document(f'''<div class="hero"><div><div class="eyebrow">BULK ONBOARDING</div><h1>Import laptop records</h1><p class="subtitle muted">Move your historical invoice records into the AMC register with a CSV file.</p></div><a class="btn secondary" href="/">← Dashboard</a></div>{notice}<section class="panel"><h2>1. Prepare your CSV</h2><p class="muted">Download the template, fill one row per laptop, and save as UTF-8 CSV. Purchase and coverage dates can be YYYY-MM-DD or DD/MM/YYYY.</p><a class="btn secondary" href="/template.csv">↓ Download blank template</a><p class="helper">Required columns: client_name, model, serial_number, purchase_date, coverage_type. For AMC/LMC Warranty, coverage_start and coverage_end are also required.</p></section><section class="panel"><h2>2. Upload and import</h2><form action="/import" method="post" enctype="multipart/form-data">{csrf_field(session)}<div class="field" style="margin-bottom:19px"><label for="file">CSV file (maximum 2 MB)</label><input id="file" class="input" type="file" name="file" accept=".csv,text/csv" required></div><button class="btn" type="submit">Import laptop records</button></form><p class="helper" style="margin-top:14px">Existing serial numbers are skipped, never silently overwritten. Invalid rows are reported. Export a backup before large imports.</p></section>''','Import CSV',session,'import')
 
 
-def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "", serial: str = "", login_error: str = "") -> str:
-    # Public landing offers lookup and admin authentication. Successful lookup gets its own result screen.
-    notice = f'<div class="notice error" role="alert">{h(error)}</div>' if error else ''
-    login_notice = f'<div class="notice error" role="alert">{h(login_error)}</div>' if login_error else ''
-    result = ''
+def account_lookup_page(session: dict, asset: sqlite3.Row | None = None, error: str = "") -> str:
+    notice = f'<div class="notice error">{h(error)}</div>' if error else ''
     if asset is not None:
         status, days, color = coverage_status(asset)
-        # The business owner is deliberately public on exact-serial matches.
-        # Never expose purchase dates, invoice references, internal notes,
-        # asset IDs or history in this response.
+        fields = [('Owner / B2B client', asset['client_name']), ('Manufacturer', asset['manufacturer']),
+                  ('Model', asset['model']), ('Serial number', asset['serial_number']),
+                  ('Purchase date', human_date(asset['purchase_date'])),
+                  ('Coverage starts', human_date(asset['coverage_start'])),
+                  ('Coverage ends (inclusive)', human_date(asset['coverage_end']))]
+        details = ''.join(f'<div class="detail"><div class="name">{h(k)}</div><div class="answer">{h(v)}</div></div>' for k,v in fields)
+        content = f'''<div class="hero"><div><div class="eyebrow">DEVICE LOOKUP</div><h1>Check Coverage</h1></div><a class="btn secondary" href="/">← Dashboard</a></div><section class="panel guest-result"><h2>{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div></div><div class="details">{details}</div><div class="guest-back"><a class="btn" href="/lookup">← Back</a></div></section>'''
+        return document(content, 'Check Coverage', session, 'lookup')
+    content = f'''<div class="hero"><div><div class="eyebrow">DEVICE LOOKUP</div><h1>Check Coverage</h1><p class="subtitle muted">Enter a complete serial number to view its current LMC coverage.</p></div><a class="btn secondary" href="/">← Dashboard</a></div>{notice}<section class="panel"><form class="search" method="post" action="/account/lookup">{csrf_field(session)}<input class="input" name="serial_number" placeholder="Enter Serial Number" minlength="3" maxlength="100" required autofocus autocomplete="off"><button class="btn" type="submit">Submit</button></form></section>'''
+    return document(content, 'Check Coverage', session, 'lookup')
+
+
+def client_row_html(row: sqlite3.Row) -> str:
+    status, days, color = coverage_status(row)
+    return f'''<tr><td><a class="serial" href="/my-device/{row['id']}">{h(row['serial_number'])}</a></td><td><strong>{h(row['manufacturer'])} {h(row['model'])}</strong></td><td>{human_date(row['purchase_date'])}</td><td>{human_date(row['coverage_end'])}</td><td><span class="badge {color}">{h(status)}</span><div class="tiny">{h(remaining_text(status, days))}</div></td><td><a href="/my-device/{row['id']}">View →</a></td></tr>'''
+
+
+def client_dashboard(session: dict, query: str = "", page: int = 1) -> str:
+    cid = int(session['client_id'])
+    today = dt.date.today().isoformat()
+    in30 = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+    with db_connect() as db:
+        total = db.execute("SELECT COUNT(*) FROM assets WHERE client_id=?", (cid,)).fetchone()[0]
+        covered = db.execute("SELECT COUNT(*) FROM assets WHERE client_id=? AND coverage_type!='No Coverage' AND coverage_start<=? AND coverage_end>=?", (cid,today,today)).fetchone()[0]
+        expiring = db.execute("SELECT COUNT(*) FROM assets WHERE client_id=? AND coverage_type!='No Coverage' AND coverage_start<=? AND coverage_end BETWEEN ? AND ?", (cid,today,today,in30)).fetchone()[0]
+        expired = db.execute("SELECT COUNT(*) FROM assets WHERE client_id=? AND coverage_type!='No Coverage' AND coverage_end<?", (cid,today)).fetchone()[0]
+        terms = ["client_id=?"]
+        params: list = [cid]
+        if query.strip():
+            terms.append("(serial_key LIKE ? OR model LIKE ? OR manufacturer LIKE ? OR invoice_number LIKE ?)")
+            params.extend([f"%{normalize_serial(query)}%", f"%{query.strip()}%", f"%{query.strip()}%", f"%{query.strip()}%"])
+        where = " WHERE " + " AND ".join(terms)
+        matched = db.execute("SELECT COUNT(*) FROM assets"+where, params).fetchone()[0]
+        page = max(1, min(page, max(1, (matched+49)//50)))
+        rows = db.execute("SELECT * FROM assets"+where+" ORDER BY CASE WHEN coverage_end IS NULL THEN 1 ELSE 0 END, coverage_end ASC, id DESC LIMIT 50 OFFSET ?", [*params,(page-1)*50]).fetchall()
+    metrics = [('Devices purchased', total, 'Registered with LMC World'), ('Currently covered', covered, 'Active LMC coverage'), ('Expiring ≤ 30 days', expiring, 'Coverage nearing expiry'), ('Expired', expired, 'Coverage ended')]
+    cards = ''.join(f'<div class="card"><div class="label">{h(label)}</div><div class="value number">{value}</div><div class="foot">{h(foot)}</div></div>' for label,value,foot in metrics)
+    rows_html = ''.join(client_row_html(r) for r in rows) if rows else '<tr><td colspan="6"><div class="empty">No matching devices.</div></td></tr>'
+    search = f'''<form class="search" action="/" method="get"><input class="input" name="q" value="{h(query)}" placeholder="Search serial number, model or invoice..."><button class="btn" type="submit">Search</button></form>'''
+    quick = f'''<form class="search" method="post" action="/account/lookup">{csrf_field(session)}<input class="input" name="serial_number" placeholder="Enter Serial Number" minlength="3" maxlength="100" required autocomplete="off"><button class="btn" type="submit">Submit</button></form>'''
+    pg = ''
+    if matched > 50:
+        def u(p): return '/?' + urlencode({'q':query,'page':p})
+        pg = f'''<div class="pagination">{('<a class="btn secondary small" href="'+h(u(page-1))+'">← Previous</a>') if page>1 else ''}<span>Page {page} of {(matched+49)//50}</span>{('<a class="btn secondary small" href="'+h(u(page+1))+'">Next →</a>') if page*50<matched else ''}</div>'''
+    content = f'''<div class="hero"><div><div class="eyebrow">B2B CUSTOMER ACCOUNT</div><h1>{h(session['client_name'])}</h1><p class="subtitle muted">Your LMC World device register and coverage status.</p></div></div><section class="cards">{cards}</section><section class="panel"><h2>Check Coverage</h2>{quick}</section><section class="panel"><div class="split"><h2>My Devices <span class="muted" style="font-size:14px;font-weight:500">({matched})</span></h2>{'<a href="/" class="btn secondary small">Clear search</a>' if query else ''}</div>{search}<div class="tablewrap" style="margin-top:15px"><table><thead><tr><th>Serial number</th><th>Device</th><th>Purchase date</th><th>Coverage ends</th><th>Status</th><th></th></tr></thead><tbody>{rows_html}</tbody></table></div>{pg}</section>'''
+    return document(content, 'My Devices', session, 'dashboard')
+
+
+def client_asset_detail(session: dict, asset: sqlite3.Row) -> str:
+    status, days, color = coverage_status(asset)
+    pairs = [('Owner / B2B client', asset['client_name']), ('Manufacturer', asset['manufacturer']),
+             ('Model', asset['model']), ('Serial number', asset['serial_number']),
+             ('Purchase date', human_date(asset['purchase_date'])), ('Invoice reference', asset['invoice_number'] or '—'),
+             ('Coverage type', asset['coverage_type']), ('Coverage start', human_date(asset['coverage_start'])),
+             ('Coverage end (inclusive)', human_date(asset['coverage_end']))]
+    details = ''.join(f'<div class="detail"><div class="name">{h(k)}</div><div class="answer">{h(v)}</div></div>' for k,v in pairs)
+    content = f'''<div class="hero"><div><div class="eyebrow">MY DEVICE</div><h1>{h(asset['manufacturer'])} {h(asset['model'])}</h1><p class="subtitle muted">Serial number: <strong>{h(asset['serial_number'])}</strong></p></div><a class="btn secondary" href="/">← My Devices</a></div><section class="panel"><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status,days))}</div></div><div class="details">{details}</div></section>'''
+    return document(content, 'Device Details', session, 'dashboard')
+
+
+def clients_page(session: dict, msg: str = "", error: str = "") -> str:
+    with db_connect() as db:
+        rows = db.execute("""SELECT c.id,c.name,c.active,COUNT(DISTINCT a.id) AS device_count,
+                             u.id AS user_id,u.username,u.active AS user_active
+                             FROM clients c
+                             LEFT JOIN assets a ON a.client_id=c.id
+                             LEFT JOIN users u ON u.client_id=c.id AND u.role='client'
+                             GROUP BY c.id,u.id ORDER BY c.name COLLATE NOCASE""").fetchall()
+    notice = f'<div class="notice {"error" if error else ""}">{h(error or msg)}</div>' if (msg or error) else ''
+    body = ''
+    for r in rows:
+        login = h(r['username']) if r['username'] else 'Not created'
+        state = 'Enabled' if r['user_id'] and r['user_active'] and r['active'] else ('Disabled' if r['user_id'] else '—')
+        badge = 'green' if state=='Enabled' else 'red' if state=='Disabled' else 'neutral'
+        body += f'''<tr><td><strong>{h(r['name'])}</strong></td><td class="number">{r['device_count']}</td><td>{login}</td><td><span class="badge {badge}">{state}</span></td><td><a href="/client/{r['id']}/credentials">Manage login →</a></td></tr>'''
+    if not body:
+        body = '<tr><td colspan="5"><div class="empty">Clients will appear automatically when laptops are registered or imported.</div></td></tr>'
+    content = f'''<div class="hero"><div><div class="eyebrow">ACCESS CONTROL</div><h1>Client Logins</h1><p class="subtitle muted">Create and control credentials for each B2B client. Clients never self-register.</p></div></div>{notice}<section class="panel"><div class="tablewrap"><table><thead><tr><th>Client</th><th>Devices</th><th>Username</th><th>Login status</th><th></th></tr></thead><tbody>{body}</tbody></table></div></section>'''
+    return document(content, 'Client Logins', session, 'clients')
+
+
+def client_credentials_page(session: dict, client: sqlite3.Row, user: sqlite3.Row | None, msg: str = "", error: str = "") -> str:
+    notice = f'<div class="notice {"error" if error else ""}">{h(error or msg)}</div>' if (msg or error) else ''
+    username = user['username'] if user else ''
+    password_label = 'New password (leave blank to keep current)' if user else 'Password'
+    required = '' if user else ' required'
+    toggle = ''
+    if user:
+        action = 'Disable Login' if user['active'] else 'Enable Login'
+        css = 'danger' if user['active'] else 'secondary'
+        toggle = f'''<form method="post" action="/client/{client['id']}/toggle" style="margin-top:16px">{csrf_field(session)}<button class="btn {css}" type="submit">{action}</button></form>'''
+    content = f'''<div class="hero"><div><div class="eyebrow">CLIENT ACCESS</div><h1>{h(client['name'])}</h1><p class="subtitle muted">Credentials are created and controlled by LMC World.</p></div><a class="btn secondary" href="/clients">← Client Logins</a></div>{notice}<section class="panel"><h2>{'Update Login' if user else 'Create Login'}</h2><form method="post" action="/client/{client['id']}/credentials">{csrf_field(session)}<div class="formgrid"><div class="field"><label>Username</label><input class="input" name="username" value="{h(username)}" minlength="3" maxlength="80" required autocomplete="off"></div><div class="field"><label>{password_label}</label><input class="input" type="password" name="password" minlength="10" maxlength="200"{required} autocomplete="new-password"></div></div><div class="actions" style="margin-top:20px"><button class="btn" type="submit">Save Credentials</button></div></form>{toggle}</section>'''
+    return document(content, 'Client Login', session, 'clients')
+
+
+def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "", serial: str = "", login_error: str = "") -> str:
+    notice = f'<div class="notice error" role="alert">{h(error)}</div>' if error else ''
+    login_notice = f'<div class="notice error" role="alert">{h(login_error)}</div>' if login_error else ''
+    if asset is not None:
+        status, days, color = coverage_status(asset)
         fields = [('Owner / B2B client', asset['client_name']),
                   ('Manufacturer', asset['manufacturer']), ('Model', asset['model']),
                   ('Serial number', asset['serial_number']),
@@ -449,16 +629,14 @@ def guest_page(session: dict, asset: sqlite3.Row | None = None, error: str = "",
                   ('Coverage ends (inclusive)', human_date(asset['coverage_end']))]
         details = ''.join(f'<div class="detail"><div class="name">{h(label)}</div><div class="answer">{h(value)}</div></div>' for label, value in fields)
         result = f'''<section class="panel guest-result" aria-label="Coverage result"><h2 style="margin-top:0">{h(asset['manufacturer'])} {h(asset['model'])}</h2><div class="statusbox {color}"><span class="badge {color}">{h(status.upper())}</span><div class="big">{h(remaining_text(status, days))}</div></div><div class="details">{details}</div><div class="guest-back"><a class="btn" href="/guest">← Back</a></div></section>'''
-        # No login or lookup form on a successful result. Back returns to a fresh public landing.
         return document(f'''<div class="landing-shell"><div class="landing-intro"><h1>AMC Portal</h1></div>{result}</div>''', 'AMC Portal', guest=True)
-    # Missing/invalid serials and admin-login errors retain the two usable landing forms.
     focus = '' if login_error else ' autofocus'
-    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>AMC Portal</h1></div><div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup"><h2>Check Coverage</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" type="submit">Submit</button></form></section><section class="panel" id="admin"><h2>Admin Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="admin_password">Enter password</label><input class="input" id="admin_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn" type="submit">Log In</button></form></section></div></div>'''
+    content = f'''<div class="landing-shell"><div class="landing-intro"><h1>AMC Portal</h1></div><div class="landing-grid"><section class="panel" id="coverage" aria-label="Coverage lookup"><h2>Check Coverage</h2>{notice}<form method="post" action="/guest/lookup">{csrf_field(session)}<div class="field"><label for="serial_number">Enter Serial Number</label><input class="input" id="serial_number" name="serial_number" value="{h(serial)}" placeholder="e.g. XHDHDJDJ" minlength="3" maxlength="100" required{focus} autocomplete="off"></div><button class="btn" type="submit">Submit</button></form></section><section class="panel" id="login"><h2>Admin / Client Login</h2>{login_notice}<form action="/login" method="post"><div class="field"><label for="login_username">Username</label><input class="input" id="login_username" name="username" maxlength="80" required autocomplete="username"></div><div class="field" style="margin-top:15px"><label for="login_password">Password</label><input class="input" id="login_password" type="password" name="password" required autocomplete="current-password"></div><button class="btn" type="submit">Log In</button></form></section></div></div>'''
     return document(content, 'AMC Portal', guest=True)
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LMCAMC/1.8.7"
+    server_version = "LMCAMC/1.9.0"
 
     def log_message(self, fmt, *args):
         print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
@@ -587,7 +765,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def setup_done(self) -> bool:
         with db_connect() as db:
-            return db.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone() is not None
+            return db.execute("SELECT 1 FROM users WHERE role='admin' AND active=1 LIMIT 1").fetchone() is not None
 
     def do_GET(self):
         try:
@@ -625,7 +803,31 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == '/':
             try: page = int(arg('page') or '1')
             except ValueError: page = 1
+            if session.get('role') == 'client':
+                return self.send(client_dashboard(session, arg('q'), page))
             return self.send(dashboard(session,arg('q'),page,arg('msg'),arg('status')))
+        if path == '/lookup':
+            return self.send(account_lookup_page(session))
+        if session.get('role') == 'client':
+            match = re.fullmatch(r'/my-device/(\d+)', path)
+            if match:
+                with db_connect() as db:
+                    asset = db.execute("SELECT * FROM assets WHERE id=? AND client_id=?", (int(match[1]), session['client_id'])).fetchone()
+                if not asset:
+                    return self.fail(404, 'Device not found in your account.')
+                return self.send(client_asset_detail(session, asset))
+            return self.fail(403, 'This page is available only to LMC administrators.')
+        # Administrator-only pages below this point.
+        if path == '/clients':
+            return self.send(clients_page(session, arg('msg')))
+        cred = re.fullmatch(r'/client/(\d+)/credentials', path)
+        if cred:
+            with db_connect() as db:
+                client = db.execute("SELECT * FROM clients WHERE id=?", (int(cred[1]),)).fetchone()
+                user = db.execute("SELECT * FROM users WHERE role='client' AND client_id=? LIMIT 1", (int(cred[1]),)).fetchone()
+            if not client:
+                return self.fail(404, 'Client not found.')
+            return self.send(client_credentials_page(session, client, user, arg('msg')))
         if path == '/asset/new':
             return self.send(asset_form(session))
         match = re.fullmatch(r'/asset/(\d+)(/edit)?',path)
@@ -650,8 +852,8 @@ class AppHandler(BaseHTTPRequestHandler):
             for asset in assets:
                 status,days,_=coverage_status(asset)
                 def safe(v):
-                    s=str(v or '')
-                    return "'"+s if s.lstrip().startswith(('=','+','-','@')) else s
+                    text=str(v or '')
+                    return "'"+text if text.lstrip().startswith(('=','+','-','@')) else text
                 writer.writerow([safe(asset[f]) for f in fields]+[status,days if days is not None else ''])
             return self.send(out.getvalue(),content_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="LMC_AMC_export.csv"'})
         if path == '/backup.db':
@@ -669,7 +871,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def setup_page(self,error=''):
         notice=f'<div class="notice error">{h(error)}</div>' if error else ''
-        return document(f'''<div class="login"><div class="panel"><div class="eyebrow">WELCOME TO LMC WORLD</div><h1>Set up AMC Manager</h1><p class="subtitle muted">Create an administrator password. Your laptop database will be stored locally in the <strong>data</strong> folder.</p>{notice}<form action="/setup" method="post"><div class="field"><label>Choose password (minimum 10 characters)</label><input class="input" type="password" name="password" minlength="10" required autocomplete="new-password"></div><div class="field"><label>Confirm password</label><input class="input" type="password" name="confirm" minlength="10" required autocomplete="new-password"></div><button class="btn" type="submit">Create secure account</button></form><p class="helper">First-time setup is only allowed from this computer. Back up your database regularly.</p></div></div>''','Setup')
+        return document(f'''<div class="login"><div class="panel"><div class="eyebrow">WELCOME TO LMC WORLD</div><h1>Set up AMC Manager</h1><p class="subtitle muted">Create the administrator credentials for this portal.</p>{notice}<form action="/setup" method="post"><div class="field"><label>Admin username</label><input class="input" name="username" value="admin" minlength="3" maxlength="80" required autocomplete="username"></div><div class="field"><label>Choose password (minimum 10 characters)</label><input class="input" type="password" name="password" minlength="10" required autocomplete="new-password"></div><div class="field"><label>Confirm password</label><input class="input" type="password" name="confirm" minlength="10" required autocomplete="new-password"></div><button class="btn" type="submit">Create secure account</button></form><p class="helper">Client credentials can be created later by the administrator.</p></div></div>''','Setup')
 
 
     def do_POST(self):
@@ -692,11 +894,17 @@ class AppHandler(BaseHTTPRequestHandler):
             if path!='/setup': return self.redirect('/setup')
             if self.client_address[0] not in ('127.0.0.1','::1'):
                 return self.fail(403,'First-time setup must be completed on the server computer.')
+            username=str(form.get('username','')).strip()
             pw=str(form.get('password',''))
+            if not re.fullmatch(r'[A-Za-z0-9._-]{3,80}', username):
+                return self.send(self.setup_page('Use a username of 3–80 letters, numbers, dots, hyphens or underscores.'),400)
             if len(pw)<10 or len(pw)>200 or pw!=form.get('confirm'):
                 return self.send(self.setup_page('Use matching passwords of at least 10 characters (maximum 200).'),400)
+            digest=password_hash(pw)
             with db_connect() as db:
-                db.execute("INSERT INTO settings(key,value) VALUES('admin_password',?)",(password_hash(pw),))
+                db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_password',?)",(digest,))
+                db.execute("INSERT INTO users(username,username_key,password_hash,role,client_id,active) VALUES(?,?,?,?,NULL,1)",
+                           (username,username_key(username),digest,'admin'))
             return self.redirect('/login')
         if path=='/login':
             ip=self.visitor_ip()
@@ -706,15 +914,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 LOGIN_FAILURES[ip]=failures
                 if len(failures)>=8:
                     return self.guest_entry(login_error='Too many attempts. Try again in 15 minutes.', status=429)
-            with db_connect() as db:
-                stored=db.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()['value']
-            if not verify_password(str(form.get('password','')),stored):
+            user=get_user_by_credentials(str(form.get('username','')), str(form.get('password','')))
+            if user is None:
                 with LOCK: LOGIN_FAILURES.setdefault(ip,[]).append(now)
-                return self.guest_entry(login_error='Incorrect password.', status=401)
+                return self.guest_entry(login_error='Incorrect username or password.', status=401)
             token=secrets.token_urlsafe(32)
             with LOCK:
                 LOGIN_FAILURES.pop(ip,None)
-                SESSIONS[token]={'csrf':secrets.token_urlsafe(32),'last':time.time()}
+                SESSIONS[token]=session_for_user(user)
             cookie=f'lmc_session={token}; HttpOnly; SameSite=Strict; Path=/'+('; Secure' if os.environ.get('AMC_HTTPS')=='1' else '')
             return self.redirect('/',cookie)
         if path == '/guest/lookup':
@@ -722,7 +929,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if guest is None:
                 return self.redirect('/')
             if not hmac.compare_digest(str(form.get('csrf', '')), guest['csrf']):
-                return self.fail(403, 'Guest session verification failed. Reload Guest Check and try again.')
+                return self.fail(403, 'Guest session verification failed. Reload Check Coverage and try again.')
             if self.guest_rate_limited(guest['token']):
                 return self.send(guest_page(guest, error='Too many searches. Please try again in 15 minutes.'),
                                  429, headers={'Retry-After': str(RATE_WINDOW_SECONDS)})
@@ -731,7 +938,6 @@ class AppHandler(BaseHTTPRequestHandler):
             if len(serial) > 100 or len(key) < 3 or len(key) > 100:
                 return self.send(guest_page(guest, error='Enter the complete serial number (3–100 characters).'), 400)
             with db_connect() as db:
-                # Exact match only. Public fields are explicitly allowlisted.
                 asset = db.execute('SELECT client_name, manufacturer, model, serial_number, coverage_type, coverage_start, coverage_end FROM assets WHERE serial_key=?', (key,)).fetchone()
             if asset is None:
                 return self.send(guest_page(guest, error='No matching coverage record found. Check the full serial number or contact LMC World.'), 200)
@@ -747,12 +953,70 @@ class AppHandler(BaseHTTPRequestHandler):
             with LOCK:
                 if 'lmc_session' in cookie: SESSIONS.pop(cookie['lmc_session'].value,None)
             return self.redirect('/login','lmc_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/' + ('; Secure' if os.environ.get('AMC_HTTPS') == '1' else ''))
+        if path=='/account/lookup':
+            serial=str(form.get('serial_number',''))
+            key=normalize_serial(serial)
+            if len(serial)>100 or len(key)<3 or len(key)>100:
+                return self.send(account_lookup_page(session,error='Enter the complete serial number (3–100 characters).'),400)
+            with db_connect() as db:
+                if session.get('role')=='client':
+                    asset=db.execute('SELECT * FROM assets WHERE serial_key=? AND client_id=?',(key,session['client_id'])).fetchone()
+                else:
+                    asset=db.execute('SELECT * FROM assets WHERE serial_key=?',(key,)).fetchone()
+            if asset is None:
+                message='No matching device found in your account.' if session.get('role')=='client' else 'No matching coverage record found.'
+                return self.send(account_lookup_page(session,error=message),200)
+            return self.send(account_lookup_page(session,asset=asset))
+        if session.get('role') != 'admin':
+            return self.fail(403,'This action is available only to LMC administrators.')
+        cred=re.fullmatch(r'/client/(\d+)/credentials',path)
+        if cred:
+            cid=int(cred[1])
+            username=str(form.get('username','')).strip()
+            password=str(form.get('password',''))
+            with db_connect() as db:
+                client=db.execute('SELECT * FROM clients WHERE id=?',(cid,)).fetchone()
+                existing=db.execute("SELECT * FROM users WHERE role='client' AND client_id=? LIMIT 1",(cid,)).fetchone()
+            if not client:
+                return self.fail(404,'Client not found.')
+            if not re.fullmatch(r'[A-Za-z0-9._-]{3,80}',username):
+                return self.send(client_credentials_page(session,client,existing,error='Username must be 3–80 letters, numbers, dots, hyphens or underscores.'),400)
+            if not existing and len(password)<10:
+                return self.send(client_credentials_page(session,client,existing,error='Password must be at least 10 characters.'),400)
+            if password and not 10<=len(password)<=200:
+                return self.send(client_credentials_page(session,client,existing,error='Password must be 10–200 characters.'),400)
+            try:
+                with db_connect() as db:
+                    if existing:
+                        if password:
+                            db.execute("UPDATE users SET username=?,username_key=?,password_hash=?,active=1,updated_at=datetime('now') WHERE id=?",
+                                       (username,username_key(username),password_hash(password),existing['id']))
+                        else:
+                            db.execute("UPDATE users SET username=?,username_key=?,active=1,updated_at=datetime('now') WHERE id=?",
+                                       (username,username_key(username),existing['id']))
+                    else:
+                        db.execute("INSERT INTO users(username,username_key,password_hash,role,client_id,active) VALUES(?,?,?,?,?,1)",
+                                   (username,username_key(username),password_hash(password),'client',cid))
+            except sqlite3.IntegrityError:
+                return self.send(client_credentials_page(session,client,existing,error='That username is already in use. Choose another username.'),409)
+            return self.redirect(f'/client/{cid}/credentials?msg='+quote('Client login saved.'))
+        toggle=re.fullmatch(r'/client/(\d+)/toggle',path)
+        if toggle:
+            cid=int(toggle[1])
+            with db_connect() as db:
+                user=db.execute("SELECT * FROM users WHERE role='client' AND client_id=? LIMIT 1",(cid,)).fetchone()
+                if not user:
+                    return self.fail(404,'Client login has not been created yet.')
+                new_state=0 if user['active'] else 1
+                db.execute("UPDATE users SET active=?,updated_at=datetime('now') WHERE id=?",(new_state,user['id']))
+            return self.redirect(f'/client/{cid}/credentials?msg='+quote('Client login enabled.' if new_state else 'Client login disabled.'))
         if path=='/asset/create':
             try: data=validate_asset(form)
             except ValueError as exc:
                 return self.send(asset_form(session,error=str(exc),form=form),400)
             try:
                 with db_connect() as db:
+                    data['client_id']=ensure_client(db,data['client_name'])
                     cols=list(data)
                     cur=db.execute(f"INSERT INTO assets({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})",list(data.values()))
                     db.execute("INSERT INTO history(asset_id,action,detail) VALUES (?, ?, ?)",(cur.lastrowid,'Created','Initial laptop and coverage record registered.'))
@@ -768,17 +1032,18 @@ class AppHandler(BaseHTTPRequestHandler):
             try: data=validate_asset(form)
             except ValueError as exc:
                 return self.send(asset_form(session,old,error=str(exc),form=form),400)
-            changes=[key for key in data if old[key]!=data[key]]
-            if changes:
-                try:
-                    with db_connect() as db:
+            try:
+                with db_connect() as db:
+                    data['client_id']=ensure_client(db,data['client_name'])
+                    changes=[key for key in data if old[key]!=data[key]]
+                    if changes:
                         db.execute('UPDATE assets SET '+','.join(f'{k}=?' for k in data)+",updated_at=datetime('now') WHERE id=?",list(data.values())+[aid])
-                        change_text='Updated: '+', '.join(k.replace('_',' ') for k in changes)
+                        change_text='Updated: '+', '.join(k.replace('_',' ') for k in changes if k!='client_id')
                         if any(k in changes for k in ('coverage_type','coverage_start','coverage_end')):
                             change_text+=f". Previous coverage: {old['coverage_type']} {old['coverage_start'] or '—'} to {old['coverage_end'] or '—'}."
-                        db.execute('INSERT INTO history(asset_id,action,detail) VALUES (?,?,?)',(aid,'Edited',change_text))
-                except sqlite3.IntegrityError:
-                    return self.send(asset_form(session,old,error='Serial number already belongs to another record.',form=form),409)
+                        db.execute('INSERT INTO history(asset_id,action,detail) VALUES (?,?,?)',(aid,'Edited',change_text or 'Client assignment updated.'))
+            except sqlite3.IntegrityError:
+                return self.send(asset_form(session,old,error='Serial number already belongs to another record.',form=form),409)
             return self.redirect(f'/asset/{aid}?msg='+quote('Record saved.'))
         renew=re.fullmatch(r'/asset/(\d+)/renew',path)
         if renew:
@@ -824,6 +1089,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         try:
                             if None in row: raise ValueError('Extra columns found; check commas and quoting.')
                             data=validate_asset(row)
+                            data['client_id']=ensure_client(db,data['client_name'])
                             cols=list(data)
                             cur=db.execute(f"INSERT OR IGNORE INTO assets({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})",list(data.values()))
                             if cur.rowcount==0: duplicates+=1
